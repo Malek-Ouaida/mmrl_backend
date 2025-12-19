@@ -9,12 +9,7 @@ from mmrl.core.engine.state import EngineState
 from mmrl.core.events.base import Event
 from mmrl.core.events.bus import EventBus
 from mmrl.core.events.marketdata import BestBidAskUpdate
-from mmrl.core.events.orders import (
-    Fill,
-    OrderCancelRequested,
-    OrderCanceled,
-    OrderSubmitted,
-)
+from mmrl.core.events.orders import Fill, OrderCanceled, OrderCancelRequested, OrderSubmitted
 from mmrl.strategies.base import Strategy
 
 log = structlog.get_logger()
@@ -41,12 +36,21 @@ class FixedSpreadMarketMaker(Strategy):
     """
     Event-driven fixed-spread market maker baseline.
 
-    - Consumes BBO updates
-    - Emits bid/ask quotes as OrderSubmitted intents
-    - Maintains at most one active bid + one active ask via cancel/replace
-    - Enforces: max 2 live quote orders total (one bid + one ask)
-    - Updates inventory on fills
+    Design goals:
+      - Deterministic: order IDs and event sequences are reproducible.
+      - Correct-by-construction cancel/replace: never more than 1 live quote per side.
+      - Conservative state machine: replacements are submitted only after cancel ack.
+      - Inventory-aware quoting: skew quotes based on current inventory.
+      - Minimal assumptions about the execution layer: cancel acks and fills may arrive
+        in any order in the future once latency/partial fills are introduced.
+
+    Event flow:
+      market.best_bid_ask -> quote decision -> (optional cancel) -> order.submitted
+      order.canceled -> submit staged replacement (if any)
+      order.fill -> update inventory + clear state for that order
     """
+
+    _EPS: float = 1e-12
 
     def __init__(
         self,
@@ -69,7 +73,8 @@ class FixedSpreadMarketMaker(Strategy):
         self._active_bid_price: float | None = None
         self._active_ask_price: float | None = None
 
-        # Pending replacements (submit only after cancel ack)
+        # Pending replacements (submit only after cancel ack).
+        # Latest-intent-wins: if mid moves while cancel in flight, update pending.
         self._pending_bid: tuple[float, float] | None = None  # (price, qty)
         self._pending_ask: tuple[float, float] | None = None  # (price, qty)
 
@@ -80,7 +85,28 @@ class FixedSpreadMarketMaker(Strategy):
             ("order.canceled", self._on_canceled),
         ]
 
-    # -------- Event handlers --------
+    # ---------------- Invariants ----------------
+
+    def _assert_invariants(self) -> None:
+        """
+        Brutal correctness checks.
+
+        Invariants:
+          - At most one active order per side is tracked.
+          - A pending replacement may only exist if there is something to cancel.
+        """
+        if self._pending_bid is not None:
+            assert self._active_bid_id is not None, "pending bid without active bid"
+        if self._pending_ask is not None:
+            assert self._active_ask_id is not None, "pending ask without active ask"
+
+    @staticmethod
+    def _same_price(a: float | None, b: float | None, eps: float) -> bool:
+        if a is None or b is None:
+            return False
+        return abs(a - b) <= eps
+
+    # ---------------- Event handlers ----------------
 
     def _on_fill(self, e: Event) -> None:
         if not isinstance(e, Fill):
@@ -91,15 +117,17 @@ class FixedSpreadMarketMaker(Strategy):
         signed = e.fill_quantity if e.side == "buy" else -e.fill_quantity
         self._inventory += signed
 
-        # Clear active IDs if the filled order was one of our active quotes
+        # Clear active IDs if the filled order was one of our active quotes.
+        # Also clear any staged replacement; it's stale once the order has filled.
         if self._active_bid_id == e.order_id:
             self._active_bid_id = None
             self._active_bid_price = None
-            self._pending_bid = None  # any staged replacement is now stale
+            self._pending_bid = None
+
         if self._active_ask_id == e.order_id:
             self._active_ask_id = None
             self._active_ask_price = None
-            self._pending_ask = None  # any staged replacement is now stale
+            self._pending_ask = None
 
         log.info(
             "strategy.inventory_updated",
@@ -110,6 +138,8 @@ class FixedSpreadMarketMaker(Strategy):
             fill_price=e.fill_price,
             inventory=self._inventory,
         )
+
+        self._assert_invariants()
 
     def _on_canceled(self, e: Event) -> None:
         if not isinstance(e, OrderCanceled):
@@ -151,6 +181,8 @@ class FixedSpreadMarketMaker(Strategy):
             symbol=e.symbol,
             order_id=e.order_id,
         )
+
+        self._assert_invariants()
 
     def _on_bbo(self, e: Event) -> None:
         if not isinstance(e, BestBidAskUpdate):
@@ -195,12 +227,15 @@ class FixedSpreadMarketMaker(Strategy):
             need_new_bid = (
                 self._active_bid_id is None
                 or self._active_bid_price is None
-                or abs(bid_quote - self._active_bid_price) > 1e-12
+                or not self._same_price(bid_quote, self._active_bid_price, self._EPS)
             )
 
             if need_new_bid:
-                if self._active_bid_id is not None:
-                    # cancel existing; submit replacement only after OrderCanceled
+                # Latest-intent-wins while cancel is in flight:
+                # if the market moves again, update the pending replacement.
+                if self._pending_bid is not None:
+                    self._pending_bid = (bid_quote, buy_size)
+                elif self._active_bid_id is not None:
                     self._pending_bid = (bid_quote, buy_size)
                     self._bus.publish(
                         OrderCancelRequested.create(
@@ -220,11 +255,14 @@ class FixedSpreadMarketMaker(Strategy):
             need_new_ask = (
                 self._active_ask_id is None
                 or self._active_ask_price is None
-                or abs(ask_quote - self._active_ask_price) > 1e-12
+                or not self._same_price(ask_quote, self._active_ask_price, self._EPS)
             )
 
             if need_new_ask:
-                if self._active_ask_id is not None:
+                # Latest-intent-wins while cancel is in flight:
+                if self._pending_ask is not None:
+                    self._pending_ask = (ask_quote, sell_size)
+                elif self._active_ask_id is not None:
                     self._pending_ask = (ask_quote, sell_size)
                     self._bus.publish(
                         OrderCancelRequested.create(
@@ -253,14 +291,20 @@ class FixedSpreadMarketMaker(Strategy):
             pending_ask=self._pending_ask is not None,
         )
 
-    # -------- Helpers --------
+        self._assert_invariants()
+
+    # ---------------- Helpers ----------------
 
     def _make_order(self, *, side: str, price: float, qty: float) -> OrderSubmitted:
-        # Deterministic order id derived from run_id, tick, side, price, qty
+        """
+        Build a deterministic OrderSubmitted event.
+
+        Order IDs are stable across replays:
+          sha1(run_id | tick | side | price | qty)[:16]
+        """
         payload = f"{self._state.run_id}|{self._state.tick}|{side}|{price:.8f}|{qty:.8f}"
         oid = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
-        seq = self._state.next_sequence()
         return OrderSubmitted.create(
             symbol=self._cfg.symbol,
             order_id=oid,
@@ -269,5 +313,5 @@ class FixedSpreadMarketMaker(Strategy):
             time_in_force="GTC",
             price=price,
             quantity=qty,
-            sequence=seq,
+            sequence=self._state.next_sequence(),
         )
