@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+
+# Envs
+.env
+.venv
+venv/
+
+# Poetry
+.poetry/
+
+# OS
+.DS_Store
+
+# Logs & runs
+runs/
+*.log
+
+# Editors
+.vscode/
+.idea/
