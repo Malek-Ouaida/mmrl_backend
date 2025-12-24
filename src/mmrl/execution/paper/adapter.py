@@ -11,10 +11,13 @@ from mmrl.core.events.orders import (
     OrderAccepted,
     OrderCanceled,
     OrderCancelRequested,
+    OrderRejected,
     OrderSubmitted,
 )
+from mmrl.execution.model.fill_model import FillModel, TopOfBookFullFillModel
 from mmrl.execution.oms.orders import OrderRecord
 from mmrl.execution.oms.positions import Position
+from mmrl.execution.oms.risk import RiskLimits, RiskManager
 
 log = structlog.get_logger()
 
@@ -30,26 +33,32 @@ class PaperExecutionAdapter:
 
     Emits:
       - order.accepted
+      - order.rejected
       - order.canceled
       - order.fill
-
-    Institutional-grade behavior (for a simulator):
-      - Symbol-scoped BBO tracking (not a single global BBO)
-      - Deterministic sequence allocation via EngineState.next_sequence()
-      - Deterministic order state transitions (open -> filled/canceled)
-      - Immediate acceptance on submit
-      - Fill checks on BOTH:
-          (1) BBO updates (resting orders become executable)
-          (2) Order submits (new orders may cross immediately)
-      - Cancels are idempotent and safe:
-          canceling a missing/non-open order is a no-op (logged at debug)
     """
 
-    _EPS: float = 1e-12
-
-    def __init__(self, *, bus: EventBus, state: EngineState) -> None:
+    def __init__(
+        self,
+        *,
+        bus: EventBus,
+        state: EngineState,
+        fill_model: FillModel | None = None,
+        risk: RiskManager | None = None,
+    ) -> None:
         self._bus = bus
         self._state = state
+
+        # Deterministic fill model (pluggable)
+        self._fill_model: FillModel = fill_model if fill_model is not None else TopOfBookFullFillModel()
+
+        # Deterministic risk gate (pluggable)
+        self._risk: RiskManager = risk if risk is not None else RiskManager(
+            limits=RiskLimits(
+                max_order_qty=1e9,
+                max_abs_inventory=1e9,
+            )
+        )
 
         # Latest BBO per symbol
         self._bbo_by_symbol: dict[str, BestBidAskUpdate] = {}
@@ -76,10 +85,8 @@ class PaperExecutionAdapter:
         if not isinstance(e, BestBidAskUpdate):
             return
 
-        # Store latest BBO for that symbol
         self._bbo_by_symbol[e.symbol] = e
 
-        # Try fill any resting orders for this symbol
         for oid in tuple(self._orders_by_symbol.get(e.symbol, ())):
             rec = self._orders.get(oid)
             if rec is None or rec.status != "open":
@@ -88,6 +95,32 @@ class PaperExecutionAdapter:
 
     def _on_order_submitted(self, e: Event) -> None:
         if not isinstance(e, OrderSubmitted):
+            return
+
+        # Risk gate first (reserve exposure deterministically)
+        rc = self._risk.check_new_order(
+            symbol=e.symbol,
+            side=e.side,
+            qty=e.quantity,
+            price=e.price,
+            order_id=e.order_id,
+        )
+        if not rc.ok:
+            self._bus.publish(
+                OrderRejected.create(
+                    symbol=e.symbol,
+                    order_id=e.order_id,
+                    reason=rc.reason,
+                    sequence=self._state.next_sequence(),
+                )
+            )
+            log.info(
+                "paper.rejected",
+                run_id=self._state.run_id,
+                symbol=e.symbol,
+                order_id=e.order_id,
+                reason=rc.reason,
+            )
             return
 
         # Accept immediately (paper venue)
@@ -112,8 +145,7 @@ class PaperExecutionAdapter:
         )
 
         # Attempt immediate fill against latest known BBO for this symbol
-        bbo = self._bbo_by_symbol.get(e.symbol)
-        if bbo is not None:
+        if e.symbol in self._bbo_by_symbol:
             self._try_fill(rec)
 
     def _on_cancel_requested(self, e: Event) -> None:
@@ -130,7 +162,6 @@ class PaperExecutionAdapter:
             )
             return
 
-        # Safety: ignore mismatched symbol cancels
         if rec.symbol != e.symbol:
             log.debug(
                 "paper.cancel_ignored_symbol_mismatch",
@@ -154,6 +185,9 @@ class PaperExecutionAdapter:
         rec.cancel()
         self._orders_by_symbol.get(rec.symbol, set()).discard(rec.order_id)
 
+        # Release reserved exposure
+        self._risk.on_cancel(order_id=e.order_id)
+
         self._bus.publish(
             OrderCanceled.create(
                 symbol=e.symbol,
@@ -172,13 +206,6 @@ class PaperExecutionAdapter:
     # ---------------- Fill model ----------------
 
     def _try_fill(self, order: OrderRecord) -> None:
-        """
-        Deterministic fill model:
-          - Limit orders execute if they touch/cross top-of-book
-          - Buy executes at ask when order.price >= ask
-          - Sell executes at bid when order.price <= bid
-          - Full fill (for now): fill_qty = remaining
-        """
         if order.status != "open":
             return
 
@@ -186,29 +213,15 @@ class PaperExecutionAdapter:
         if bbo is None:
             return
 
-        bid = bbo.bid_price
-        ask = bbo.ask_price
-        if bid <= 0 or ask <= 0:
+        decision = self._fill_model.decide(order=order, bbo=bbo)
+        if not decision.executable:
             return
 
-        # Only limit supported right now (market orders later)
-        if order.price is None:
-            return
+        assert decision.fill_price is not None, "FillModel returned executable without fill_price"
+        assert decision.fill_qty is not None, "FillModel returned executable without fill_qty"
 
-        # Determine if executable and choose fill price
-        if order.side == "buy":
-            executable = order.price + self._EPS >= ask
-            fill_price = ask
-        else:
-            executable = order.price - self._EPS <= bid
-            fill_price = bid
-
-        if not executable:
-            return
-
-        fill_qty = order.remaining
-        if fill_qty <= self._EPS:
-            return
+        fill_price = decision.fill_price
+        fill_qty = decision.fill_qty
 
         order.apply_fill(fill_qty=fill_qty)
 
@@ -219,11 +232,17 @@ class PaperExecutionAdapter:
             self._positions[order.symbol] = pos
         pos.on_fill(side=order.side, qty=fill_qty, price=fill_price)
 
-        # If filled, remove from symbol index
+        # Update risk inventory (tie to order_id so reservations are released)
+        self._risk.on_fill(
+            symbol=order.symbol,
+            side=order.side,
+            qty=fill_qty,
+            order_id=order.order_id,
+        )
+
         if order.status != "open":
             self._orders_by_symbol.get(order.symbol, set()).discard(order.order_id)
 
-        # Emit fill event
         self._bus.publish(
             Fill.create(
                 symbol=order.symbol,
