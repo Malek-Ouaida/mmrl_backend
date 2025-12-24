@@ -7,11 +7,12 @@ from typing import Any
 
 import structlog
 
-from mmrl.core.run.artifacts import artifacts_for, RunArtifacts
-from mmrl.core.run.spec import RunSpec
+from mmrl.core.run.artifacts import RunArtifacts, artifacts_for
 from mmrl.core.run.assembly import RunHandle, build_run
+from mmrl.core.run.spec import RunSpec
 
 from mmrl.marketdata.replay.datasource import ReplayDataSource
+from mmrl.marketdata.replay.jsonl_datasource import JsonlReplayDataSource
 from mmrl.strategies.baselines.fixed_spread import FixedSpreadConfig
 
 log = structlog.get_logger()
@@ -22,9 +23,9 @@ class RunFactory:
     Product-grade run builder.
 
     Responsibilities:
-    - load/persist RunSpec
+    - load/persist RunSpec (config.json)
     - build RunHandle through canonical assembly
-    - write wiring snapshot for audit/repro
+    - write wiring snapshot (meta.json) for audit/repro
     """
 
     def __init__(self, *, runs_dir: Path):
@@ -40,7 +41,6 @@ class RunFactory:
             raise FileNotFoundError(f"run not found: {run_id}")
 
         if not art.config_json.exists():
-            # fall back to defaults if config.json doesn't exist
             return RunSpec()
 
         data = json.loads(art.config_json.read_text(encoding="utf-8"))
@@ -50,7 +50,6 @@ class RunFactory:
         art = artifacts_for(runs_dir=self.runs_dir, run_id=run_id)
         art.ensure_dirs()
 
-        # Persist canonical JSON
         payload = spec.to_canonical_dict()
         art.config_json.write_text(
             json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
@@ -77,11 +76,7 @@ class RunFactory:
 
         # Translate MarketDataSpec -> args for build_run
         mode = spec.marketdata.mode
-
-        replay_ds: ReplayDataSource | None = None
-        if mode == "paper_replay_l2":
-            # You decide how ReplayDataSource loads; this keeps factory clean.
-            replay_ds = ReplayDataSource(path=spec.marketdata.replay_l2.path)  # type: ignore[union-attr]
+        replay_ds = self._build_replay_datasource(spec) if mode == "paper_replay_l2" else None
 
         handle = build_run(
             runs_dir=self.runs_dir,
@@ -116,19 +111,28 @@ class RunFactory:
             min_ticks_between_quotes=p.min_ticks_between_quotes,
         )
 
+    def _build_replay_datasource(self, spec: RunSpec) -> ReplayDataSource:
+        r = spec.marketdata.replay_l2
+        if r is None:
+            raise ValueError("marketdata.replay_l2 is required when mode='paper_replay_l2'")
+
+        replay_path = Path(r.path)
+        if not replay_path.exists():
+            raise FileNotFoundError(f"replay datasource not found: {replay_path}")
+
+        # 'format' is optional in your spec; default to jsonl.
+        fmt = getattr(r, "format", None) or "jsonl"
+        if fmt != "jsonl":
+            raise ValueError(f"unsupported replay format: {fmt!r} (only 'jsonl' supported)")
+
+        return JsonlReplayDataSource(path=replay_path)
+
     def _write_wiring_snapshot(self, *, art: RunArtifacts, spec: RunSpec, handle: RunHandle) -> None:
         """
         Writes a reproducible snapshot of what was wired.
         Uses meta.json (already part of your artifacts contract).
         """
-        components = []
-        for c in handle.components:
-            components.append(
-                {
-                    "type": type(c).__name__,
-                    "module": type(c).__module__,
-                }
-            )
+        components = [{"type": type(c).__name__, "module": type(c).__module__} for c in handle.components]
 
         snapshot: dict[str, Any] = {
             "run_id": handle.run_id,
@@ -140,13 +144,9 @@ class RunFactory:
             "components": components,
         }
 
-        # Optional: include router wiring if it's serializable
         try:
             w = handle.wiring
-            if is_dataclass(w):
-                snapshot["router_wiring"] = asdict(w)
-            else:
-                snapshot["router_wiring"] = str(w)
+            snapshot["router_wiring"] = asdict(w) if is_dataclass(w) else str(w)
         except Exception:
             snapshot["router_wiring"] = "unavailable"
 
