@@ -3,9 +3,9 @@ from __future__ import annotations
 import structlog
 
 from mmrl.core.engine.lifecycle import EngineLifecycle
-from mmrl.core.engine.state import EngineState
 from mmrl.core.events.bus import EventBus
 from mmrl.core.events.system import EngineError, EngineTick
+from mmrl.core.engine.state import EngineState
 
 log = structlog.get_logger()
 
@@ -14,8 +14,8 @@ class Engine:
     """
     Deterministic event-driven engine.
 
-    This runs a tick loop and emits EngineTick events.
-    Other components (marketdata, strategy, execution) attach via the EventBus.
+    Runs a tick loop and emits EngineTick events.
+    Other components attach via the EventBus.
     """
 
     def __init__(self, *, run_id: str, bus: EventBus) -> None:
@@ -41,20 +41,24 @@ class Engine:
             while self._state.is_running and self._state.tick < max_ticks:
                 tick = self._state.next_tick()
 
-                # Emit tick event
-                evt = EngineTick.create(
-                    run_id=self._state.run_id,
-                    tick=tick,
+                self._bus.publish(
+                    EngineTick.create(
+                        run_id=self._state.run_id,
+                        tick=tick,
+                        sequence=self._state.next_sequence(),
+                    )
                 )
-                self._bus.publish(evt)
 
-        except Exception as exc:  # fail-fast with explicit event emission
-            err_evt = EngineError.create(
-                run_id=self._state.run_id,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
+        except Exception as exc:
+            # Fail-fast with explicit event emission (must include sequence)
+            self._bus.publish(
+                EngineError.create(
+                    run_id=self._state.run_id,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    sequence=self._state.next_sequence(),
+                )
             )
-            self._bus.publish(err_evt)
             log.exception("engine.crashed", run_id=self._state.run_id)
             raise
 
