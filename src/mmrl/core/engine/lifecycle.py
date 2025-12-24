@@ -29,16 +29,24 @@ class EngineLifecycle:
         if self._state.is_running:
             raise RuntimeError("engine already running")
 
-        # Bind run_id to structured log context
         bind_context(run_id=self._state.run_id, component="engine")
 
-        self._state.is_running = True
+        # Reset deterministic counters
         self._state.tick = 0
         self._state.sequence = 0
 
-        # Emit RunStarted event (sequence-free on purpose; it is a boundary marker)
-        event = RunStarted.create(run_id=self._state.run_id)
-        self._bus.publish(event)
+        # Enter running state FIRST (sequence/tick guards depend on this)
+        self._state.is_running = True
+
+        # Allocate a sequence for RunStarted (required by Event schema)
+        seq = self._state.next_sequence()
+
+        self._bus.publish(
+            RunStarted.create(
+                run_id=self._state.run_id,
+                sequence=seq,
+            )
+        )
 
         log.info("engine.started", run_id=self._state.run_id)
 
@@ -46,9 +54,17 @@ class EngineLifecycle:
         if not self._state.is_running:
             raise RuntimeError("engine not running")
 
+        # Allocate sequence while still running
+        seq = self._state.next_sequence()
+
+        # Transition to stopped
         self._state.is_running = False
 
-        event = RunStopped.create(run_id=self._state.run_id)
-        self._bus.publish(event)
+        self._bus.publish(
+            RunStopped.create(
+                run_id=self._state.run_id,
+                sequence=seq,
+            )
+        )
 
         log.info("engine.stopped", run_id=self._state.run_id)
