@@ -1,3 +1,4 @@
+# src/mmrl/execution/paper/adapter.py
 from __future__ import annotations
 
 import structlog
@@ -57,6 +58,7 @@ class PaperExecutionAdapter:
             limits=RiskLimits(
                 max_order_qty=1e9,
                 max_abs_inventory=1e9,
+                max_order_notional=None,
             )
         )
 
@@ -87,6 +89,7 @@ class PaperExecutionAdapter:
 
         self._bbo_by_symbol[e.symbol] = e
 
+        # Try fill any open orders for this symbol on each BBO update
         for oid in tuple(self._orders_by_symbol.get(e.symbol, ())):
             rec = self._orders.get(oid)
             if rec is None or rec.status != "open":
@@ -136,10 +139,14 @@ class PaperExecutionAdapter:
         self._orders[e.order_id] = rec
         self._orders_by_symbol.setdefault(e.symbol, set()).add(e.order_id)
 
+        # ✅ FIX: OrderAccepted must include side/price/quantity
         self._bus.publish(
             OrderAccepted.create(
                 symbol=e.symbol,
                 order_id=e.order_id,
+                side=e.side,
+                price=e.price,
+                quantity=e.quantity,
                 sequence=self._state.next_sequence(),
             )
         )
@@ -220,8 +227,11 @@ class PaperExecutionAdapter:
         assert decision.fill_price is not None, "FillModel returned executable without fill_price"
         assert decision.fill_qty is not None, "FillModel returned executable without fill_qty"
 
-        fill_price = decision.fill_price
-        fill_qty = decision.fill_qty
+        fill_price = float(decision.fill_price)
+        fill_qty = float(decision.fill_qty)
+
+        if fill_qty <= 0:
+            return
 
         order.apply_fill(fill_qty=fill_qty)
 

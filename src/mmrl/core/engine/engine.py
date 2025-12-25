@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import structlog
+from typing import Iterable, Optional
 
 from mmrl.core.engine.lifecycle import EngineLifecycle
+from mmrl.core.engine.router import EngineRouter, EventComponent
+from mmrl.core.engine.state import EngineState
 from mmrl.core.events.bus import EventBus
 from mmrl.core.events.system import EngineError, EngineTick
-from mmrl.core.engine.state import EngineState
 
 log = structlog.get_logger()
 
@@ -18,10 +20,22 @@ class Engine:
     Other components attach via the EventBus.
     """
 
-    def __init__(self, *, run_id: str, bus: EventBus) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        bus: EventBus,
+        components: Optional[Iterable[EventComponent]] = None,
+    ) -> None:
         self._bus = bus
         self._state = EngineState(run_id=run_id)
         self._lifecycle = EngineLifecycle(bus=bus, state=self._state)
+
+        # ✅ deterministic wiring (only if components provided)
+        self._router = EngineRouter(bus=bus)
+        self._wiring = None
+        if components is not None:
+            self._wiring = self._router.register(components)
 
     @property
     def bus(self) -> EventBus:
@@ -50,7 +64,6 @@ class Engine:
                 )
 
         except Exception as exc:
-            # Fail-fast with explicit event emission (must include sequence)
             self._bus.publish(
                 EngineError.create(
                     run_id=self._state.run_id,

@@ -10,25 +10,19 @@ from mmrl.core.config.settings import settings
 from mmrl.core.run.artifacts import artifacts_for
 from mmrl.core.run.factory import RunFactory
 from mmrl.core.run.manager import RunManager
+from mmrl.core.run.persist import persist_risk_inventory
 from mmrl.core.run.registry import RunRegistry, RunStatus
 from mmrl.core.run.spec import RunSpec
 
 router = APIRouter(tags=["runs"])
 
-# Minimal singleton for now (works in single-process dev).
 _registry = RunRegistry()
 
-# Live handles in this process only (dev-mode)
 _live_lock = Lock()
 _live: dict[str, "RunHandle"] = {}
 
-# Import type only (avoid circulars)
-from mmrl.core.run.assembly import RunHandle  # noqa: E402  (safe in runtime too)
+from mmrl.core.run.assembly import RunHandle  # noqa: E402
 
-
-# =========================
-# Schemas
-# =========================
 
 class CreateRunRequest(BaseModel):
     seed: int | None = Field(default=None, description="Optional RNG seed override")
@@ -64,9 +58,19 @@ class RunsListResponse(BaseModel):
     runs: list[RunDetailsResponse]
 
 
-# =========================
-# Routes
-# =========================
+def _artifact_paths(run_id: str) -> dict[str, str]:
+    art = artifacts_for(runs_dir=settings.runs_dir, run_id=run_id)
+    return {
+        "config_json": str(art.config_json),
+        "meta_json": str(art.meta_json),
+        "events_jsonl": str(art.events_jsonl),
+        "metrics_json": str(art.metrics_json),
+        "evaluation_json": str(art.evaluation_json),
+        "engine_log": str(art.engine_log),
+        "risk_inventory_parquet": str(art.risk_inventory_parquet),
+        "risk_inventory_summary_json": str(art.risk_inventory_summary_json),
+    }
+
 
 @router.post("/runs", response_model=CreateRunResponse)
 def create_run(payload: CreateRunRequest) -> CreateRunResponse:
@@ -77,22 +81,18 @@ def create_run(payload: CreateRunRequest) -> CreateRunResponse:
 
     _registry.upsert_created(run)
 
-    # Ensure artifacts exist (idempotent)
     art = artifacts_for(runs_dir=settings.runs_dir, run_id=run.run_id)
     art.ensure_dirs()
     art.events_jsonl.touch(exist_ok=True)
 
-    # Persist RunSpec as canonical config.json
     factory = RunFactory(runs_dir=settings.runs_dir)
 
     if payload.run_spec is None:
-        # Default spec, but seed should reflect what the run was created with
         spec = RunSpec(seed=seed)
     else:
-        # Respect caller, but keep seed aligned unless explicitly set
         spec = payload.run_spec
         if spec.seed is None:
-            spec.seed = seed  # pydantic model is mutable by default
+            spec.seed = seed
 
     factory.save_spec(run_id=run.run_id, spec=spec)
 
@@ -130,7 +130,6 @@ def start_run(run_id: str) -> StartRunResponse:
         return StartRunResponse(run_id=run_id, status="running")
     except Exception as e:
         _registry.mark_error(run_id=run_id, error_type=type(e).__name__, error_message=str(e))
-        # If start fails, don't keep a broken live handle around
         with _live_lock:
             _live.pop(run_id, None)
         raise HTTPException(status_code=409, detail=str(e))
@@ -152,11 +151,18 @@ def stop_run(run_id: str) -> StopRunResponse:
         handle.lifecycle.stop()
         _registry.mark_stopped(run_id=run_id)
 
-        # remove handle so a future /start creates a fresh lifecycle
+        # ✅ institutional persistence
+        persist_risk_inventory(
+            art=handle.artifacts,
+            series=handle.risk_component.series,
+            max_inventory=handle.max_inventory,
+        )
+
         with _live_lock:
             _live.pop(run_id, None)
 
         return StopRunResponse(run_id=run_id, status="stopped")
+
     except Exception as e:
         _registry.mark_error(run_id=run_id, error_type=type(e).__name__, error_message=str(e))
         raise HTTPException(status_code=409, detail=str(e))
@@ -174,14 +180,7 @@ def list_runs() -> RunsListResponse:
                 created_at_utc=rec.created_at_utc,
                 updated_at_utc=rec.updated_at_utc,
                 run_dir=str(art.run_dir),
-                artifacts={
-                    "config_json": str(art.config_json),
-                    "meta_json": str(art.meta_json),
-                    "events_jsonl": str(art.events_jsonl),
-                    "metrics_json": str(art.metrics_json),
-                    "evaluation_json": str(art.evaluation_json),
-                    "engine_log": str(art.engine_log),
-                },
+                artifacts=_artifact_paths(rec.run_id),
                 error_type=rec.error_type,
                 error_message=rec.error_message,
             )
@@ -216,14 +215,7 @@ def get_run(run_id: str) -> RunDetailsResponse:
         created_at_utc=created,
         updated_at_utc=updated,
         run_dir=str(art.run_dir),
-        artifacts={
-            "config_json": str(art.config_json),
-            "meta_json": str(art.meta_json),
-            "events_jsonl": str(art.events_jsonl),
-            "metrics_json": str(art.metrics_json),
-            "evaluation_json": str(art.evaluation_json),
-            "engine_log": str(art.engine_log),
-        },
+        artifacts=_artifact_paths(run_id),
         error_type=error_type,
         error_message=error_message,
     )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +9,6 @@ import structlog
 from mmrl.core.run.artifacts import RunArtifacts, artifacts_for
 from mmrl.core.run.assembly import RunHandle, build_run
 from mmrl.core.run.spec import RunSpec
-
 from mmrl.marketdata.replay.datasource import ReplayDataSource
 from mmrl.marketdata.replay.jsonl_datasource import JsonlReplayDataSource
 from mmrl.strategies.baselines.fixed_spread import FixedSpreadConfig
@@ -25,7 +23,7 @@ class RunFactory:
     Responsibilities:
     - load/persist RunSpec (config.json)
     - build RunHandle through canonical assembly
-    - write wiring snapshot (meta.json) for audit/repro
+    - write wiring snapshot (meta.json) for audit/repro (JSON-safe)
     """
 
     def __init__(self, *, runs_dir: Path):
@@ -87,7 +85,7 @@ class RunFactory:
             replay_l2=replay_ds,
         )
 
-        # Founder-level audit: write wiring snapshot
+        # Founder-level audit: write wiring snapshot (JSON-safe)
         self._write_wiring_snapshot(art=handle.artifacts, spec=spec, handle=handle)
 
         return handle
@@ -120,7 +118,6 @@ class RunFactory:
         if not replay_path.exists():
             raise FileNotFoundError(f"replay datasource not found: {replay_path}")
 
-        # 'format' is optional in your spec; default to jsonl.
         fmt = getattr(r, "format", None) or "jsonl"
         if fmt != "jsonl":
             raise ValueError(f"unsupported replay format: {fmt!r} (only 'jsonl' supported)")
@@ -130,9 +127,28 @@ class RunFactory:
     def _write_wiring_snapshot(self, *, art: RunArtifacts, spec: RunSpec, handle: RunHandle) -> None:
         """
         Writes a reproducible snapshot of what was wired.
-        Uses meta.json (already part of your artifacts contract).
+
+        Institutional rule:
+        - NEVER serialize live callables (handlers) into JSON.
+        - Snapshot only stable metadata: component names, event types, handler qualnames.
         """
         components = [{"type": type(c).__name__, "module": type(c).__module__} for c in handle.components]
+
+        # JSON-safe router wiring snapshot
+        wiring_safe: list[dict[str, str]] = []
+        try:
+            for ws in handle.wiring.subscriptions:
+                sub = ws.subscription
+                handler = getattr(sub, "handler", None)
+                wiring_safe.append(
+                    {
+                        "component": ws.component,
+                        "event_type": getattr(sub, "event_type", "unknown"),
+                        "handler": getattr(handler, "__qualname__", "unknown"),
+                    }
+                )
+        except Exception:
+            wiring_safe = []
 
         snapshot: dict[str, Any] = {
             "run_id": handle.run_id,
@@ -142,13 +158,8 @@ class RunFactory:
             "strategy_kind": spec.strategy.kind,
             "execution_kind": spec.execution.kind,
             "components": components,
+            "router_wiring": wiring_safe,
         }
-
-        try:
-            w = handle.wiring
-            snapshot["router_wiring"] = asdict(w) if is_dataclass(w) else str(w)
-        except Exception:
-            snapshot["router_wiring"] = "unavailable"
 
         art.meta_json.write_text(
             json.dumps(snapshot, indent=2, sort_keys=True, ensure_ascii=False) + "\n",

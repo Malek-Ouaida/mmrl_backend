@@ -4,14 +4,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
 
 def validate_run_id(run_id: str) -> None:
-    """
-    Defensive: prevent path traversal or weird IDs.
-    """
     if not run_id or not _RUN_ID_RE.match(run_id):
         raise ValueError(f"invalid run_id: {run_id!r}")
 
@@ -19,9 +15,7 @@ def validate_run_id(run_id: str) -> None:
 @dataclass(frozen=True, slots=True)
 class RunArtifacts:
     """
-    Standard, stable artifact paths for a run.
-
-    This is a *contract*. Everything else depends on these filenames.
+    Stable artifact contract for a run directory.
     """
     run_dir: Path
 
@@ -35,7 +29,6 @@ class RunArtifacts:
 
     @property
     def events_jsonl(self) -> Path:
-        # Append-only event log (one JSON dict per line)
         return self.run_dir / "events.jsonl"
 
     @property
@@ -45,6 +38,15 @@ class RunArtifacts:
     @property
     def evaluation_json(self) -> Path:
         return self.run_dir / "evaluation.json"
+
+    # ✅ Risk & Inventory artifacts
+    @property
+    def risk_inventory_parquet(self) -> Path:
+        return self.run_dir / "risk_inventory.parquet"
+
+    @property
+    def risk_inventory_summary_json(self) -> Path:
+        return self.run_dir / "risk_inventory_summary.json"
 
     @property
     def logs_dir(self) -> Path:
@@ -60,13 +62,9 @@ class RunArtifacts:
 
 
 def artifacts_for(*, runs_dir: Path, run_id: str) -> RunArtifacts:
-    """
-    Resolve artifacts for run_id under runs_dir (safe).
-    """
     validate_run_id(run_id)
     run_dir = (runs_dir / run_id).resolve()
 
-    # Ensure it stays under runs_dir
     base = runs_dir.resolve()
     if base not in run_dir.parents and run_dir != base:
         raise ValueError("invalid run_dir resolution")

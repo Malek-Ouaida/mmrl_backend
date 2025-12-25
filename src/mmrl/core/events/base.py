@@ -29,7 +29,7 @@ class Event:
     # EngineState should allocate this via next_sequence().
     # For boundary markers (e.g., RunStarted) you can leave it as 0 if desired,
     # but in production we typically still sequence everything.
-    sequence: int = 0
+    sequence: int
 
     # Event type name (static per subclass)
     event_type: ClassVar[str]
